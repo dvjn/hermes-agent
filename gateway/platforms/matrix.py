@@ -57,7 +57,7 @@ import mimetypes
 import os
 import re
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
 from html import escape as _html_escape
@@ -68,6 +68,7 @@ from typing import Any, Dict, Optional, Set
 try:
     from mautrix.types import (
         ContentURI,
+        Event,
         EventID,
         EventType,
         PaginationDirection,
@@ -83,7 +84,7 @@ except ImportError:
     # check_matrix_requirements() will return False and the adapter
     # won't be instantiated in production, but tests may exercise
     # adapter methods so stubs must have the right attributes.
-    ContentURI = EventID = RoomID = SyncToken = UserID = str  # type: ignore[misc,assignment]
+    ContentURI = Event = EventID = RoomID = SyncToken = UserID = str  # type: ignore[misc,assignment]
 
     class _EventTypeStub:  # type: ignore[no-redef]
         ROOM_MESSAGE = "m.room.message"
@@ -1447,6 +1448,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
                 await self._join_pending_invites(sync_data)
+                await self._catch_up_recent_messages(self._joined_rooms)
             else:
                 logger.warning(
                     "Matrix: initial sync returned unexpected type %s",
@@ -2242,6 +2244,77 @@ class MatrixAdapter(BasePlatformAdapter):
     # Event callbacks
     # ------------------------------------------------------------------
 
+    async def _catch_up_recent_messages(self, room_ids: Set[str]) -> None:
+        """Fetch recent timeline events that may have raced invite/join sync."""
+        if not self._client or not room_ids:
+            return
+        try:
+            from mautrix.api import Method
+        except Exception:
+            return
+
+        now_ms = int(time.time() * 1000)
+        max_age_ms = 2 * 60 * 1000
+
+        for room_id in list(room_ids):
+            try:
+                data = await self._client.api.request(
+                    Method.GET,
+                    f"/_matrix/client/v3/rooms/{quote(room_id, safe='')}/messages",
+                    query_params={"dir": "b", "limit": "8"},
+                )
+            except Exception as exc:
+                logger.info("Matrix: catch-up fetch failed for %s: %s", room_id, exc)
+                continue
+
+            events = list(reversed(data.get("chunk", []) or []))
+            logger.debug(
+                "Matrix: catch-up fetched %d recent event(s) for %s",
+                len(events),
+                room_id,
+            )
+            for raw_event in events:
+                event_id = str(raw_event.get("event_id", ""))
+                raw_type = str(raw_event.get("type", ""))
+                if not event_id or event_id in self._processed_events_set:
+                    if event_id:
+                        logger.debug("Matrix: catch-up skipped duplicate event %s", event_id)
+                    continue
+                event_ts = int(raw_event.get("origin_server_ts") or 0)
+                if not event_ts or now_ms - event_ts > max_age_ms:
+                    logger.debug(
+                        "Matrix: catch-up skipped stale event %s age_ms=%s type=%s",
+                        event_id,
+                        now_ms - event_ts if event_ts else "unknown",
+                        raw_event.get("type", ""),
+                    )
+                    continue
+                raw_event["room_id"] = room_id
+                if raw_type != "m.room.message":
+                    logger.debug(
+                        "Matrix: catch-up ignored non-message event %s type=%s",
+                        event_id,
+                        raw_type,
+                    )
+                    continue
+                logger.debug(
+                    "Matrix: catch-up considering event %s type=%s age_ms=%d",
+                    event_id,
+                    raw_type,
+                    now_ms - event_ts,
+                )
+                try:
+                    event = Event.deserialize(raw_event)
+                except Exception as exc:
+                    logger.debug(
+                        "Matrix: catch-up deserialize failed for %s: %s",
+                        event_id,
+                        exc,
+                    )
+                    continue
+                setattr(event, "_matrix_allow_recent_catchup", True)
+                await self._on_room_message(event)
+
     async def _dispatch_sync(self, sync_data: Dict[str, Any]) -> None:
         """Dispatch a sync response through the mautrix event machinery."""
         client = self._client
@@ -2388,7 +2461,11 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Startup grace: ignore old messages from initial sync.
         event_ts = _matrix_event_timestamp_seconds(event)
-        if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
+        if (
+            event_ts
+            and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS
+            and not getattr(event, "_matrix_allow_recent_catchup", False)
+        ):
             # If we are well past startup but events are still being dropped
             # by the grace check, the host clock is probably set ahead of
             # real time — every live event then looks "older than startup".
@@ -2895,6 +2972,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._room_identity_cached_at.pop(room_id, None)
             logger.info("Matrix: joined %s", room_id)
             await self._refresh_dm_cache()
+            await self._catch_up_recent_messages({room_id})
             return True
         except Exception as exc:
             logger.warning("Matrix: error joining %s: %s", room_id, exc)
