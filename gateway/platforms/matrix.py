@@ -1408,6 +1408,7 @@ class MatrixAdapter(BasePlatformAdapter):
         client.add_dispatcher(MembershipEventDispatcher)
 
         client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
+        client.add_event_handler(EventType.ROOM_ENCRYPTED, self._on_room_encrypted)
         client.add_event_handler(EventType.REACTION, self._on_reaction)
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
 
@@ -2276,7 +2277,10 @@ class MatrixAdapter(BasePlatformAdapter):
             for raw_event in events:
                 event_id = str(raw_event.get("event_id", ""))
                 raw_type = str(raw_event.get("type", ""))
-                if not event_id or event_id in self._processed_events_set:
+                if not event_id or (
+                    event_id in self._processed_events_set
+                    and raw_type != "m.room.encrypted"
+                ):
                     if event_id:
                         logger.debug("Matrix: catch-up skipped duplicate event %s", event_id)
                     continue
@@ -2290,17 +2294,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
                     continue
                 raw_event["room_id"] = room_id
-                if raw_type != "m.room.message":
-                    logger.debug(
-                        "Matrix: catch-up ignored non-message event %s type=%s",
-                        event_id,
-                        raw_type,
-                    )
-                    continue
                 logger.debug(
                     "Matrix: catch-up considering event %s type=%s age_ms=%d",
                     event_id,
-                    raw_type,
+                    raw_event.get("type", ""),
                     now_ms - event_ts,
                 )
                 try:
@@ -2313,7 +2310,72 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
                     continue
                 setattr(event, "_matrix_allow_recent_catchup", True)
-                await self._on_room_message(event)
+                if raw_type == "m.room.encrypted":
+                    await self._on_room_encrypted(event)
+                elif raw_type == "m.room.message":
+                    await self._on_room_message(event)
+
+    async def _on_room_encrypted(self, event: Any) -> None:
+        """Decrypt raw encrypted timeline events and feed the normal message path.
+
+        mautrix usually dispatches decrypted ``m.room.message`` events when
+        crypto state is complete. Some homeservers/room-join flows deliver the
+        raw ``m.room.encrypted`` event without a decrypted callback, especially
+        for rooms joined after startup. This fallback makes that path explicit
+        and leaves a useful diagnostic when the room key is still missing.
+        """
+        room_id = str(getattr(event, "room_id", ""))
+        event_id = str(getattr(event, "event_id", ""))
+        sender = str(getattr(event, "sender", ""))
+
+        if self._is_self_sender(sender):
+            return
+
+        crypto = getattr(self._client, "crypto", None) if self._client else None
+        if not crypto:
+            logger.warning(
+                "Matrix: received encrypted event %s in %s but E2EE is not active",
+                event_id,
+                room_id,
+            )
+            return
+
+        try:
+            decrypted = await crypto.decrypt_megolm_event(event)
+        except Exception as exc:
+            logger.warning(
+                "Matrix: could not decrypt encrypted event %s from %s in %s: %s",
+                event_id,
+                sender,
+                room_id,
+                exc,
+            )
+            return
+
+        if getattr(event, "_matrix_allow_recent_catchup", False):
+            setattr(decrypted, "_matrix_allow_recent_catchup", True)
+        # A raw encrypted event may have been marked as processed by a fallback
+        # path before it became a decrypted message. Let the normal message
+        # handler own the final dedupe decision.
+        self._processed_events_set.discard(event_id)
+        try:
+            self._processed_events.remove(event_id)
+        except ValueError:
+            pass
+        decrypted_content = getattr(decrypted, "content", None)
+        if isinstance(decrypted_content, dict):
+            decrypted_msgtype = decrypted_content.get("msgtype", "")
+        elif hasattr(decrypted_content, "msgtype"):
+            decrypted_msgtype = str(decrypted_content.msgtype)
+        else:
+            decrypted_msgtype = ""
+        logger.debug(
+            "Matrix: decrypted encrypted event %s to type=%s msgtype=%s",
+            event_id,
+            getattr(decrypted, "type", ""),
+            decrypted_msgtype,
+        )
+        await self._on_room_message(decrypted)
 
     async def _dispatch_sync(self, sync_data: Dict[str, Any]) -> None:
         """Dispatch a sync response through the mautrix event machinery."""
